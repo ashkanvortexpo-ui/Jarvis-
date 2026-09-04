@@ -7,6 +7,9 @@ on:
       - main
       - master
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -24,21 +27,25 @@ jobs:
       - name: Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android 34
-        run: sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+      - name: Install Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
-      - name: Install Gradle 8.4
+      - name: Gradle 8.4
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.4"
 
-      - name: Create project
+      - name: Recreate Jarvis project
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf jarvis_source
-          mkdir -p jarvis_source
-          cat > /tmp/jarvis.b64 <<'EOF'
+          rm -rf /tmp/jarvis
+          mkdir -p /tmp/jarvis
+          cat > /tmp/jarvis.b64 <<'JARVIS_ARCHIVE'
           UEsDBBQAAAAIAKpjJF2CEawxVgQAAKsIAAA8AAAASmFydmlzQXBwXzYuMS1VbHRyYVZvaWNlV2FrZS9GVUxMX0FVRElUX0FORF9N
           QU5VQUxfR1VJREUudHh0hVVNb9tGEL3zV+zVB0tJ2qStgBxURU2UWpBgyUVuAUutbTYSKZC0EeVUG9bHQb/CF8mqJYESndQo4EN+
           xa586y/pm11SnwEKSMTucmfmzZs3w7fZw98KFfYi9YTts1ypWD7IV/Psl8I7Vs7mfs2+zhuGGDz2ZYfJjpiLiewyMRQhnTERygtx
@@ -893,21 +900,23 @@ jobs:
           Y29kZW1hZ2ljLnlhbWxQSwECFAMUAAAACACqYyRdekTAj3YAAACkAAAALgAAAAAAAAAAAAAAgAF95QAASmFydmlzQXBwXzYuMS1V
           bHRyYVZvaWNlV2FrZS9ncmFkbGUucHJvcGVydGllc1BLAQIUAxQAAAAIAKpjJF39T86ergAAAEYBAAAsAAAAAAAAAAAAAACAAT/m
           AABKYXJ2aXNBcHBfNi4xLVVsdHJhVm9pY2VXYWtlL3NldHRpbmdzLmdyYWRsZVBLBQYAAAAAKQApAN4SAAA35wAAAAA=
-          EOF
-          base64 -d /tmp/jarvis.b64 > /tmp/jarvis.zip
-          unzip -q /tmp/jarvis.zip -d jarvis_source
-          PROJECT_DIR="$(find jarvis_source -mindepth 1 -maxdepth 1 -type d -name 'JarvisApp_*' -print -quit)"
-          test -n "$PROJECT_DIR"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          test -f "$PROJECT_DIR/settings.gradle"
-          test -f "$PROJECT_DIR/app/build.gradle"
-          echo "Project: $PROJECT_DIR"
+          JARVIS_ARCHIVE
+          tr -d '[:space:]' < /tmp/jarvis.b64 | base64 -d > /tmp/jarvis.zip
+          unzip -q /tmp/jarvis.zip -d /tmp/jarvis
+          ROOT="$(find /tmp/jarvis -type f -name settings.gradle -printf '%h\n' | head -n 1)"
+          test -n "$ROOT"
+          echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "Project root: $ROOT"
+          test -f "$ROOT/app/build.gradle"
+          test -f "$ROOT/app/src/main/AndroidManifest.xml"
+          test -f "$ROOT/app/src/main/java/com/jarvis/assistant/MainActivity.kt"
+          test -f "$ROOT/app/src/main/java/com/jarvis/assistant/OverlayService.kt"
 
       - name: Validate XML
         shell: bash
         run: |
           set -euo pipefail
-          cd "$PROJECT_DIR"
+          cd "$PROJECT_ROOT"
           python3 - <<'PY'
           import xml.etree.ElementTree as ET
           from pathlib import Path
@@ -916,34 +925,47 @@ jobs:
           print("XML OK")
           PY
 
-      - name: Build APK
-        id: build
-        continue-on-error: true
+      - name: Compile Kotlin first
         shell: bash
         run: |
           set -o pipefail
-          cd "$PROJECT_DIR"
-          gradle --no-daemon --no-parallel --max-workers=2             -Dkotlin.compiler.execution.strategy=in-process             clean assembleDebug --stacktrace --console=plain 2>&1 | tee build.log
+          cd "$PROJECT_ROOT"
+          rm -f build.log
+          echo "===== KOTLIN COMPILE =====" | tee -a build.log
+          if ! gradle --no-daemon --no-parallel --max-workers=1               -Dkotlin.compiler.execution.strategy=in-process               :app:compileDebugKotlin --stacktrace --console=plain 2>&1 | tee -a build.log; then
+            echo
+            echo "===== FIRST USEFUL ERRORS ====="
+            grep -nE '^e: |^error:|Execution failed for task|Caused by:|FAILURE:' build.log | head -120 || true
+            echo
+            echo "===== LAST 160 LINES ====="
+            tail -160 build.log
+            exit 1
+          fi
 
-      - name: Show error
-        if: steps.build.outcome == 'failure'
+      - name: Build APK
         shell: bash
         run: |
-          cd "$PROJECT_DIR"
-          echo "===== BUILD ERROR ====="
-          grep -n -E "e: |error:|ERROR|FAILURE:|Execution failed|Caused by:" build.log | tail -120 || true
-          echo "===== LAST LOG ====="
-          tail -180 build.log
-          exit 1
+          set -o pipefail
+          cd "$PROJECT_ROOT"
+          echo "===== APK BUILD =====" | tee -a build.log
+          if ! gradle --no-daemon --no-parallel --max-workers=1               -Dkotlin.compiler.execution.strategy=in-process               :app:assembleDebug --stacktrace --console=plain 2>&1 | tee -a build.log; then
+            echo
+            echo "===== FIRST USEFUL ERRORS ====="
+            grep -nE '^e: |^error:|Execution failed for task|Caused by:|FAILURE:' build.log | head -120 || true
+            echo
+            echo "===== LAST 160 LINES ====="
+            tail -160 build.log
+            exit 1
+          fi
 
-      - name: Find APK
+      - name: Verify APK
         shell: bash
         run: |
           set -euo pipefail
-          APK="$(find "$PROJECT_DIR/app/build/outputs/apk" -type f -name '*.apk' -print -quit)"
-          test -n "$APK"
+          APK="$PROJECT_ROOT/app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          ls -lh "$APK"
           echo "APK_PATH=$APK" >> "$GITHUB_ENV"
-          echo "APK ready: $APK"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -957,5 +979,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Jarvis-build-log
-          path: ${{ env.PROJECT_DIR }}/build.log
+          path: ${{ env.PROJECT_ROOT }}/build.log
           if-no-files-found: warn
