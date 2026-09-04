@@ -1278,15 +1278,15 @@ jobs:
             anV4CwABBAAAAAAEAAAAAFBLBQYAAAAAOgA6AJYeAAB29gAAAAA=
         run: |
           set -euo pipefail
-          rm -rf JarvisApp_6.0_VoiceWake
+          rm -rf JarvisApp_6.1-UltraVoiceWake
           printf '%s' "$JARVIS_ZIP_B64" | tr -d '\n\r ' | base64 -d > /tmp/jarvis.zip
           unzip -q /tmp/jarvis.zip
-          test -f JarvisApp_6.0_VoiceWake/settings.gradle
-          test -f JarvisApp_6.0_VoiceWake/app/build.gradle
-          test -f JarvisApp_6.0_VoiceWake/app/src/main/AndroidManifest.xml
-          test -f JarvisApp_6.0_VoiceWake/app/src/main/java/com/jarvis/assistant/OverlayService.kt
+          test -f JarvisApp_6.1-UltraVoiceWake/settings.gradle
+          test -f JarvisApp_6.1-UltraVoiceWake/app/build.gradle
+          test -f JarvisApp_6.1-UltraVoiceWake/app/src/main/AndroidManifest.xml
+          test -f JarvisApp_6.1-UltraVoiceWake/app/src/main/java/com/jarvis/assistant/OverlayService.kt
       - name: Validate source
-        working-directory: JarvisApp_6.0_VoiceWake
+        working-directory: JarvisApp_6.1-UltraVoiceWake
         run: |
           set -euo pipefail
           grep -q 'versionCode 13' app/build.gradle
@@ -1298,10 +1298,10 @@ jobs:
           print('Manifest XML OK')
           PY
       - name: Build APK
-        working-directory: JarvisApp_6.0_VoiceWake
+        working-directory: JarvisApp_6.1-UltraVoiceWake
         run: gradle --no-daemon --stacktrace :app:assembleDebug
       - name: Verify APK
-        working-directory: JarvisApp_6.0_VoiceWake
+        working-directory: JarvisApp_6.1-UltraVoiceWake
         run: |
           set -euo pipefail
           test -s app/build/outputs/apk/debug/app-debug.apk
@@ -1310,5 +1310,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Jarvis-6.1-UltraVoiceWake-APK
-          path: JarvisApp_6.0_VoiceWake/app/build/outputs/apk/debug/app-debug.apk
+          path: JarvisApp_6.1-UltraVoiceWake/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
