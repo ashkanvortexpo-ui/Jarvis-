@@ -1,0 +1,27 @@
+JARVIS 6.0 - COMPLETE FIX PACKAGE
+
+این نسخه برای رفع مشکلات شناخته‌شده‌ی نسخه‌های قبلی آماده شده است.
+
+فایل‌های اصلی اصلاح‌شده:
+- OverlayService.kt: رفع کرش Context/mainLooper، مدیریت صحیح lifecycle، TTS، جلوگیری از شنیدن صدای خودش، fallback زبان، restart امن SpeechRecognizer
+- MainActivity.kt: مدیریت مجوزها و وضعیت واقعی سرویس، شروع سرویس فقط از Activity قابل مشاهده، مدیریت Screen Capture
+- CommandProcessor.kt: دستورهای اپ، تایمر فارسی، یادداشت/کار، پروفایل‌ها، تنظیمات، AI و تحلیل تصویر
+- AssistantTools.kt: تایمر/یادآوری، PendingIntent امن، پاک‌کردن یادداشت و کار
+- AppLauncher.kt: Intentهای مقاوم‌تر برای دوربین/گالری/مخاطبین/پیامک و fallback اپ‌ها
+- AndroidManifest.xml: مجوزها و foreground service typeهای لازم
+- SettingsEditorActivity.kt: اعتبارسنجی مقادیر تنظیمات
+- GeminiClient.kt: خطاهای HTTP قابل فهم‌تر و endpoint پایدار gemini-2.5-flash
+
+تست‌های لازم روی گوشی:
+1) مجوز میکروفون
+2) نمایش روی برنامه‌ها
+3) اعلان‌ها
+4) Battery = Unrestricted برای Jarvis در MIUI/HyperOS
+5) اجرای «گوش‌به‌زنگ جارویس» از داخل برنامه
+6) «جارویس»
+7) «جارویس اینستاگرام را باز کن»
+8) «جارویس تایمر پنج دقیقه»
+9) «جارویس یادداشت کن فردا تماس بگیر»
+10) «جارویس آنالیز صفحه» پس از Screen Capture
+
+محدودیت‌های سیستم Android: میکروفون foreground service باید با RECORD_AUDIO و foregroundServiceType=microphone و از Activity قابل مشاهده شروع شود. Screen capture هم باید با رضایت کاربر و MediaProjection شروع شود. سرویس نمی‌تواند بدون اجازه‌ی سیستم و کاربر، محدودیت‌های Android را دور بزند.

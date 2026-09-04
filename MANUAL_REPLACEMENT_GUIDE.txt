@@ -1,0 +1,28 @@
+JARVIS 5.8 ALL FIX - MANUAL REPLACEMENT
+
+این بسته نسخه کامل پروژه است. برای ویرایش دستی در GitHub، فایل‌های زیر را دقیقاً در همان مسیرها جایگزین کن:
+
+1) OverlayService.kt
+2) CommandProcessor.kt
+3) AppLauncher.kt
+4) MainActivity.kt
+5) AssistantTools.kt
+6) AndroidManifest.xml
+7) app/build.gradle
+
+بقیه فایل‌ها در پروژه فعلی را حذف نکن؛ در این بسته نسخه کامل پروژه هم قرار دارد.
+
+اصلاحات اصلی:
+- رفع کرش Handler(mainLooper) در OverlayService
+- پایدارتر شدن چرخه SpeechRecognizer
+- بررسی اجازه Overlay قبل از نمایش هولوگرام
+- پشتیبانی از فرمان «جارویس + دستور»
+- پاک‌کردن «را/رو/لطفاً/برام» از نام برنامه
+- بازکردن مستقیم اپ‌های شناخته‌شده حتی بدون «باز کن»
+- پشتیبانی تایمر با اعداد فارسی و کلمات یک تا ده و ساعت/دقیقه/ثانیه
+- Intentهای امن‌تر برای برنامه‌ها و تنظیمات
+- اصلاح ReminderReceiver و PendingIntent
+- اضافه‌شدن query سرویس Speech و TTS در Manifest
+- versionCode=11 / versionName=5.8-AllFix
+
+نکته: هیچ نسخه‌ای را نمی‌توان بدون اجرای روی مدل گوشی کاربر «تضمین کامل» کرد. این نسخه خطاهای مشاهده‌شده در Build و کرش فعلی و چند مسیر اصلی فرمان صوتی را اصلاح می‌کند.

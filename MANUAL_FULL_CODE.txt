@@ -1,0 +1,1051 @@
+JARVIS 5.8 ALL FIX - MANUAL REPLACEMENT
+
+این بسته نسخه کامل پروژه است. برای ویرایش دستی در GitHub، فایل‌های زیر را دقیقاً در همان مسیرها جایگزین کن:
+
+1) OverlayService.kt
+2) CommandProcessor.kt
+3) AppLauncher.kt
+4) MainActivity.kt
+5) AssistantTools.kt
+6) AndroidManifest.xml
+7) app/build.gradle
+
+بقیه فایل‌ها در پروژه فعلی را حذف نکن؛ در این بسته نسخه کامل پروژه هم قرار دارد.
+
+اصلاحات اصلی:
+- رفع کرش Handler(mainLooper) در OverlayService
+- پایدارتر شدن چرخه SpeechRecognizer
+- بررسی اجازه Overlay قبل از نمایش هولوگرام
+- پشتیبانی از فرمان «جارویس + دستور»
+- پاک‌کردن «را/رو/لطفاً/برام» از نام برنامه
+- بازکردن مستقیم اپ‌های شناخته‌شده حتی بدون «باز کن»
+- پشتیبانی تایمر با اعداد فارسی و کلمات یک تا ده و ساعت/دقیقه/ثانیه
+- Intentهای امن‌تر برای برنامه‌ها و تنظیمات
+- اصلاح ReminderReceiver و PendingIntent
+- اضافه‌شدن query سرویس Speech و TTS در Manifest
+- versionCode=11 / versionName=5.8-AllFix
+
+نکته: هیچ نسخه‌ای را نمی‌توان بدون اجرای روی مدل گوشی کاربر «تضمین کامل» کرد. این نسخه خطاهای مشاهده‌شده در Build و کرش فعلی و چند مسیر اصلی فرمان صوتی را اصلاح می‌کند.
+
+
+================================================================================
+
+
+===== app/src/main/java/com/jarvis/assistant/OverlayService.kt =====
+
+package com.jarvis.assistant
+
+import android.Manifest
+import android.app.*
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.PixelFormat
+import android.graphics.RadialGradient
+import android.graphics.Shader
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.IBinder
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
+import android.view.Gravity
+import android.view.LayoutInflater
+import android.view.View
+import android.view.WindowManager
+import android.view.animation.DecelerateInterpolator
+import android.widget.TextView
+import androidx.core.app.NotificationCompat
+import java.util.Locale
+
+class OverlayService : Service(), RecognitionListener {
+    private lateinit var windowManager: WindowManager
+    private var overlayView: View? = null
+    private lateinit var speechRecognizer: SpeechRecognizer
+    private lateinit var recognizerIntent: Intent
+    private lateinit var tts: TextToSpeech
+    private lateinit var commandProcessor: CommandProcessor
+    private val handler = Handler(Looper.getMainLooper())
+
+    private enum class Mode { STANDBY, ACTIVE }
+    private var mode = Mode.STANDBY
+    private var isListening = false
+    private var restartScheduled = false
+    private var destroyed = false
+    private var handlingCommand = false
+    private var ttsReady = false
+
+    private val wakeWords = listOf("جارویس", "جارویز", "ژارویس", "jarvis")
+    private val offWords = listOf("خاموش", "خاموش شو", "غیرفعال", "غیرفعال شو", "خواب")
+
+    companion object {
+        const val CHANNEL_ID = "jarvis_channel"
+        const val NOTIF_ID = 1
+        const val ACTION_STOP = "com.jarvis.assistant.STOP"
+        private const val PREFS = "jarvis_runtime"
+        private const val KEY_ENABLED = "enabled"
+        @Volatile var isRunning: Boolean = false
+            private set
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        isRunning = true
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_ENABLED, true).apply()
+        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        commandProcessor = CommandProcessor(this)
+
+        tts = TextToSpeech(this) { status ->
+            ttsReady = status == TextToSpeech.SUCCESS
+            if (ttsReady) applyTtsSettings()
+        }
+
+        if (Build.VERSION.SDK_INT >= 23 && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            stopSelf()
+            return
+        }
+
+        startForegroundCompat()
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            stopSelf()
+            return
+        }
+        setupSpeechRecognizer()
+        handler.post { startListening() }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_ENABLED, false).apply()
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        return START_STICKY
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun startForegroundCompat() {
+        if (Build.VERSION.SDK_INT >= 26) {
+            val nm = getSystemService(NotificationManager::class.java)
+            nm.createNotificationChannel(NotificationChannel(CHANNEL_ID, "Jarvis", NotificationManager.IMPORTANCE_LOW))
+        }
+        val n = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("جارویس آماده‌باش است")
+            .setContentText("بگو «جارویس» و سپس دستورت را بگو")
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setOngoing(true)
+            .build()
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+        } else startForeground(NOTIF_ID, n)
+    }
+
+    private fun setupSpeechRecognizer() {
+        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
+        speechRecognizer.setRecognitionListener(this)
+        recognizerIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "fa-IR")
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "fa-IR")
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+        }
+    }
+
+    private fun normalize(input: String): String = input.trim()
+        .replace('ي', 'ی').replace('ك', 'ک')
+        .replace('ۀ', 'ه').replace('ة', 'ه')
+        .replace("‌", " ").replace(Regex("\\s+"), " ")
+        .lowercase(Locale.ROOT)
+
+    private fun startListening() {
+        if (destroyed || isListening || restartScheduled || handlingCommand) return
+        if (Build.VERSION.SDK_INT >= 23 && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return
+        try {
+            isListening = true
+            speechRecognizer.startListening(recognizerIntent)
+        } catch (_: Exception) {
+            isListening = false
+            scheduleRestart(1200)
+        }
+    }
+
+    private fun scheduleRestart(delay: Long = 700) {
+        if (destroyed || restartScheduled || handlingCommand) return
+        restartScheduled = true
+        isListening = false
+        try { speechRecognizer.cancel() } catch (_: Exception) {}
+        handler.postDelayed({
+            restartScheduled = false
+            if (!destroyed && !handlingCommand) startListening()
+        }, delay)
+    }
+
+    override fun onPartialResults(partialResults: Bundle?) {
+        // Do not activate/stop the recognizer on partial results. Doing that used to
+        // cut off phrases such as «جارویس اینستاگرام را باز کن» before onResults().
+    }
+
+    override fun onResults(results: Bundle?) {
+        isListening = false
+        if (destroyed || handlingCommand) return
+        val raw = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty()
+        val text = normalize(raw)
+        if (text.isBlank()) { scheduleRestart(400); return }
+        handleRecognizedText(text)
+    }
+
+    private fun handleRecognizedText(text: String) {
+        val hasWake = containsWakeWord(text)
+        val hasOff = containsOffWord(text)
+
+        if (mode == Mode.STANDBY) {
+            if (!hasWake) { scheduleRestart(400); return }
+            mode = Mode.ACTIVE
+            showOverlay()
+            val cleaned = stripWakeWord(text)
+            if (cleaned.isBlank() || isOnPhrase(cleaned)) {
+                updateStatusText("جارویس فعال است — آماده‌ام")
+                speak("فعال شدم")
+                scheduleRestart(700)
+            } else {
+                processCommand(cleaned)
+            }
+            return
+        }
+
+        if (hasOff) {
+            deactivateJarvis()
+            return
+        }
+
+        val cleaned = stripWakeWord(text)
+        if (cleaned.isBlank() || isOnPhrase(cleaned)) {
+            showOverlay()
+            updateStatusText("جارویس فعال است — آماده‌ام")
+            speak("فعال هستم")
+            scheduleRestart(700)
+            return
+        }
+        processCommand(cleaned)
+    }
+
+    private fun processCommand(cleaned: String) {
+        handlingCommand = true
+        updateStatusText("در حال پردازش...")
+        commandProcessor.process(cleaned) { reply ->
+            if (destroyed) return@process
+            handlingCommand = false
+            updateStatusText("جارویس فعال است — آماده‌ام")
+            speak(reply)
+            scheduleRestart(900)
+        }
+    }
+
+    private fun isOnPhrase(text: String): Boolean {
+        val t = normalize(text)
+        return t == "روشن" || t == "فعال" || t == "روشن شو" || t == "فعال شو"
+    }
+
+    private fun containsWakeWord(text: String) = wakeWords.any { text.contains(it) }
+    private fun containsOffWord(text: String) = offWords.any { text.contains(it) }
+
+    private fun stripWakeWord(text: String): String {
+        var r = text
+        wakeWords.forEach { r = r.replace(it, "", ignoreCase = true) }
+        return normalize(r)
+    }
+
+    private fun deactivateJarvis() {
+        mode = Mode.STANDBY
+        handlingCommand = false
+        updateStatusText("جارویس در حالت آماده‌باش است")
+        speak("جارویس خاموش شد")
+        hideOverlay()
+        scheduleRestart(900)
+    }
+
+    override fun onError(error: Int) {
+        isListening = false
+        if (!destroyed && !handlingCommand) scheduleRestart(700)
+    }
+    override fun onReadyForSpeech(params: Bundle?) {}
+    override fun onBeginningOfSpeech() {}
+    override fun onRmsChanged(rmsdB: Float) {}
+    override fun onBufferReceived(buffer: ByteArray?) {}
+    override fun onEndOfSpeech() { isListening = false }
+    override fun onEvent(eventType: Int, params: Bundle?) {}
+
+    private fun applyTtsSettings() {
+        try {
+            tts.language = Locale("fa", "IR")
+            tts.setSpeechRate(when (JarvisSettings.get(this, "voice_speed", "عادی")) {
+                "آرام" -> 0.85f
+                "سریع" -> 1.15f
+                else -> 1.0f
+            })
+        } catch (_: Exception) {}
+    }
+
+    private fun speak(text: String) {
+        if (!ttsReady || text.isBlank()) return
+        applyTtsSettings()
+        try { tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "jarvis_utterance") } catch (_: Exception) {}
+    }
+
+    private fun showOverlay() {
+        if (destroyed || overlayView != null || !JarvisSettings.getBool(this, "hologram_enabled", true)) return
+        if (Build.VERSION.SDK_INT >= 23 && !android.provider.Settings.canDrawOverlays(this)) return
+        overlayView = LayoutInflater.from(this).inflate(R.layout.overlay_jarvis, null)
+        val flag = if (Build.VERSION.SDK_INT >= 26) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            flag,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            PixelFormat.TRANSLUCENT
+        )
+        params.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+        params.y = 48
+        try { windowManager.addView(overlayView, params) } catch (_: Exception) { overlayView = null; return }
+        overlayView?.scaleX = .35f; overlayView?.scaleY = .35f; overlayView?.alpha = 0f
+        overlayView?.animate()?.scaleX(1f)?.scaleY(1f)?.alpha(1f)?.setDuration(420)?.setInterpolator(DecelerateInterpolator())?.start()
+    }
+
+    private fun hideOverlay() {
+        val view = overlayView ?: return
+        overlayView = null
+        view.animate().scaleX(.35f).scaleY(.35f).alpha(0f).setDuration(220).withEndAction {
+            try { windowManager.removeView(view) } catch (_: Exception) {}
+        }.start()
+    }
+
+    private fun updateStatusText(text: String) {
+        overlayView?.findViewById<TextView>(R.id.jarvis_status_text)?.text = text
+    }
+
+    override fun onDestroy() {
+        destroyed = true
+        isRunning = false
+        handler.removeCallbacksAndMessages(null)
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_ENABLED, false).apply()
+        try { speechRecognizer.cancel(); speechRecognizer.destroy() } catch (_: Exception) {}
+        hideOverlay()
+        try { tts.stop(); tts.shutdown() } catch (_: Exception) {}
+        super.onDestroy()
+    }
+
+}
+
+class JarvisOrbView @JvmOverloads constructor(
+    context: android.content.Context,
+    attrs: android.util.AttributeSet? = null
+) : View(context, attrs) {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND }
+    private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val startNanos = System.nanoTime()
+    init { setLayerType(View.LAYER_TYPE_SOFTWARE, null) }
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val cx = width / 2f; val cy = height / 2f; val r = minOf(width, height) * .36f
+        val t = (System.nanoTime() - startNanos) / 1_000_000_000f; val pulse = (kotlin.math.sin(t * 2.4f) + 1f) / 2f
+        fill.shader = RadialGradient(cx, cy, r * .95f, intArrayOf(Color.argb(210,0,220,255), Color.argb(70,0,180,255), Color.TRANSPARENT), floatArrayOf(0f,.42f,1f), Shader.TileMode.CLAMP)
+        canvas.drawCircle(cx, cy, r * (.82f + pulse*.04f), fill); fill.shader = null
+        ring(canvas,cx,cy,r*1.20f,2.5f,190); ring(canvas,cx,cy,r*1.06f,1.6f,135); ring(canvas,cx,cy,r*.91f,1.2f,95)
+        orbit(canvas,cx,cy,r*1.10f,r*.38f,t*42f,2f,215); orbit(canvas,cx,cy,r*.98f,r*.30f,-t*30f,1.5f,160); orbit(canvas,cx,cy,r*.80f,r*.25f,t*56f,1.1f,120)
+        for (i in 0 until 8) { val a=Math.toRadians((i*22.5+t*18.0)%180.0); val xs=kotlin.math.abs(kotlin.math.cos(a)).toFloat(); paint.color=Color.argb((80+70*xs).toInt(),0,210,255); paint.strokeWidth=1f; canvas.drawOval(cx-r*xs,cy-r,cx+r*xs,cy+r,paint) }
+        val core=r*(.18f+pulse*.025f); fill.shader=RadialGradient(cx,cy,core*2.2f,intArrayOf(Color.WHITE,Color.rgb(0,220,255),Color.TRANSPARENT),floatArrayOf(0f,.25f,1f),Shader.TileMode.CLAMP); canvas.drawCircle(cx,cy,core*2.2f,fill); fill.shader=null; fill.color=Color.rgb(0,205,255); canvas.drawCircle(cx,cy,core,fill); postInvalidateOnAnimation()
+    }
+    private fun ring(c:Canvas,x:Float,y:Float,r:Float,w:Float,a:Int){paint.color=Color.argb(a,0,210,255);paint.strokeWidth=w;c.drawCircle(x,y,r,paint)}
+    private fun orbit(c:Canvas,x:Float,y:Float,rx:Float,ry:Float,rot:Float,w:Float,a:Int){c.save();c.rotate(rot,x,y);paint.color=Color.argb(a,0,220,255);paint.strokeWidth=w;c.drawOval(x-rx,y-ry,x+rx,y+ry,paint);c.restore()}
+}
+
+
+
+===== app/src/main/java/com/jarvis/assistant/CommandProcessor.kt =====
+
+package com.jarvis.assistant
+
+import android.content.Context
+import android.content.Intent
+import android.os.Handler
+import android.os.Looper
+import android.provider.Settings
+import java.util.Locale
+import java.util.concurrent.Executors
+
+class CommandProcessor(private val context: Context) {
+    private val appLauncher = AppLauncher(context)
+    private val executor = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private val openWords = listOf("باز کن", "باز کردن", "بازش کن", "اجرا کن", "اجرا", "برو به", "برو", "open", "launch")
+
+    private fun normalize(input: String): String = input.trim()
+        .replace('ي', 'ی').replace('ك', 'ک')
+        .replace('ۀ', 'ه').replace('ة', 'ه')
+        .replace("‌", " ").replace(Regex("\\s+"), " ")
+        .replace('۰','0').replace('۱','1').replace('۲','2').replace('۳','3').replace('۴','4')
+        .replace('۵','5').replace('۶','6').replace('۷','7').replace('۸','8').replace('۹','9')
+        .replace("نیم", "0.5")
+        .lowercase(Locale.ROOT)
+
+    private fun numberWordsToDigits(s: String): String {
+        var r = normalize(s)
+        val words = linkedMapOf(
+            "ده" to "10", "نه" to "9", "هشت" to "8", "هفت" to "7", "شش" to "6",
+            "پنج" to "5", "چهار" to "4", "سه" to "3", "دو" to "2", "یک" to "1", "یه" to "1"
+        )
+        for ((word, digit) in words) {
+            r = r.replace(Regex("""(?<![\p{L}])${Regex.escape(word)}(?![\p{L}])"""), digit)
+        }
+        return r
+    }
+
+    fun process(command: String, callback: (String) -> Unit) {
+        val text = command.trim()
+        if (text.isEmpty()) { callback("متوجه نشدم، دوباره بگو"); return }
+        val lower = normalize(text)
+
+        if (lower.contains("خودت بازی کن") || lower.contains("خودت بازی رو کن") || lower.contains("حالت بازی هوشمند")) {
+            GamingAiManager.enable(context)
+            try {
+                context.startActivity(Intent(context, MainActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    .putExtra(MainActivity.EXTRA_START_GAMING_CAPTURE, true))
+            } catch (_: Exception) {}
+            callback("حالت بازی هوشمند فعال شد؛ اجازه تحلیل صفحه را تأیید کن.")
+            return
+        }
+
+        if (lower.contains("بس کن") || lower.contains("توقف بازی") || lower.contains("حالت بازی هوشمند خاموش") ||
+            lower.contains("بازی رو متوقف کن") || lower.contains("خودم بازی میکنم") || lower.contains("خودم بازی می‌کنم") ||
+            lower.contains("من خودم بازی میکنم") || lower.contains("من خودم بازی می‌کنم")) {
+            GamingAiManager.disable(context)
+            callback("حالت بازی هوشمند متوقف شد.")
+            return
+        }
+
+        if (openWords.any { lower.contains(it) }) {
+            val appName = cleanAppName(text)
+            val opened = appLauncher.openApp(appName)
+            callback(if (opened) "${appName.ifBlank { "برنامه" }} را باز کردم" else "برنامه «${appName.ifBlank { text }}» پیدا نشد")
+            return
+        }
+
+        // Direct app names also work without saying "باز کن".
+        val directAppWords = listOf("اینستاگرام", "تلگرام", "واتساپ", "یوتیوب", "کروم", "دوربین", "گالری", "مخاطبین", "پیامک", "پلی استور", "اسنپ", "دیجی کالا", "بله", "روبیکا", "ایتا", "ایکس", "توییتر")
+        if (directAppWords.any { lower == it || lower.startsWith("$it ") }) {
+            val opened = appLauncher.openApp(cleanAppName(text))
+            if (opened) { callback("برنامه را باز کردم"); return }
+        }
+
+        if (lower.startsWith("نصب ") || lower.contains("نصب کن") || lower.contains("دانلود و نصب")) {
+            val name = cleanGeneric(text, listOf("دانلود و نصب", "نصب کن", "نصب", "را", "رو"))
+            if (name.isNotBlank()) {
+                val ok = InstallerManager.openPlayStoreSearch(context, name)
+                callback(if (ok) "صفحه نصب «$name» را باز کردم؛ تأیید نهایی با خودت است." else "نتوانستم صفحه نصب را باز کنم")
+                return
+            }
+        }
+
+        if (lower.contains("وی پی ان") || lower.contains("vpn") || lower.contains("فیلتر شکن")) {
+            val name = cleanGeneric(text, listOf("وی پی ان", "vpn", "فیلتر شکن", "روشن کن", "را", "رو"))
+            val ok = VpnManager.openVpn(context, name)
+            callback(if (ok) "برنامه یا تنظیمات VPN را باز کردم؛ روشن‌کردن نهایی ممکن است تأیید خودت را بخواهد." else "نتوانستم VPN را باز کنم")
+            return
+        }
+
+        if (lower.contains("تنظیمات جارویس") || lower.contains("مرکز کنترل جارویس") || lower.contains("تنظیمات پیشرفته جارویس")) {
+            safeStart(Intent(context, JarvisSettingsActivity::class.java))
+            callback("مرکز کنترل تنظیمات جارویس را باز کردم"); return
+        }
+
+        if (lower.contains("حالت بازی") || lower.contains("پروفایل بازی")) { JarvisSettings.applyProfile(context, "بازی"); callback("پروفایل بازی فعال شد"); return }
+        if (lower.contains("حالت شب") || lower.contains("پروفایل شب")) { JarvisSettings.applyProfile(context, "شب"); callback("پروفایل شب فعال شد"); return }
+
+        if (lower.contains("تنظیمات وای فای") || lower.contains("تنظیمات وای‌فای")) { openSetting(Settings.ACTION_WIFI_SETTINGS, "تنظیمات وای‌فای را باز کردم", callback); return }
+        if (lower.contains("تنظیمات بلوتوث")) { openSetting(Settings.ACTION_BLUETOOTH_SETTINGS, "تنظیمات بلوتوث را باز کردم", callback); return }
+        if (lower.contains("تنظیمات باتری")) { openSetting(Settings.ACTION_BATTERY_SAVER_SETTINGS, "تنظیمات باتری را باز کردم", callback); return }
+        if (lower.contains("تنظیمات نمایشگر") || lower.contains("تنظیمات صفحه نمایش")) { openSetting(Settings.ACTION_DISPLAY_SETTINGS, "تنظیمات نمایشگر را باز کردم", callback); return }
+
+        if (lower.startsWith("یادداشت کن") || lower.startsWith("یادداشت ")) {
+            val note = cleanGeneric(text, listOf("یادداشت کن", "یادداشت", "را", "رو"))
+            if (note.isNotBlank()) { AssistantTools.addNote(context, note); callback("یادداشت ذخیره شد") }
+            else callback("متن یادداشت را بگو")
+            return
+        }
+
+        if (lower.startsWith("کارم را ثبت کن") || lower.startsWith("کار را ثبت کن") || lower.startsWith("کار ")) {
+            val task = cleanGeneric(text, listOf("کارم را ثبت کن", "کار را ثبت کن", "کار", "را", "رو"))
+            if (task.isNotBlank()) { AssistantTools.addTask(context, task); callback("کار ذخیره شد") }
+            else callback("متن کار را بگو")
+            return
+        }
+
+        if (lower.contains("یادداشت ها") || lower.contains("یادداشت‌ها") || lower.contains("کارهای من") || lower.contains("فهرست کارها")) {
+            callback(AssistantTools.summary(context)); return
+        }
+
+        val timerText = numberWordsToDigits(text)
+        val timerMatch = Regex("(?:تایمر|یادآوری)\\s*(\\d+(?:\\.5)?)\\s*(ثانیه|دقیقه|ساعت)?").find(timerText.lowercase(Locale.ROOT))
+        if (timerMatch != null) {
+            val number = timerMatch.groupValues[1].toDoubleOrNull() ?: 0.0
+            val unit = timerMatch.groupValues[2]
+            val seconds = when (unit) { "ساعت" -> (number * 3600).toLong(); "دقیقه" -> (number * 60).toLong(); else -> number.toLong() }
+            if (seconds > 0) { AssistantTools.setTimer(context, seconds.toInt()); callback("تایمر تنظیم شد") }
+            else callback("زمان تایمر را مشخص کن")
+            return
+        }
+
+        if (lower.contains("فایل ها") || lower.contains("فایل‌ها") || lower.contains("مدیریت فایل")) { FileManagerHelper.openFiles(context); callback("مدیریت فایل را باز کردم"); return }
+        if (lower.contains("حافظه گوشی") || lower.contains("فضای ذخیره سازی") || lower.contains("فضای ذخیره‌سازی")) { FileManagerHelper.openStorageSettings(context); callback("تنظیمات حافظه را باز کردم"); return }
+
+        if (lower.contains("آنالیز صفحه") || lower.contains("تحلیل صفحه") || lower.contains("آنالیز بازی") || lower.contains("تحلیل بازی") || lower.contains("حریف را تحلیل") || lower.contains("حریف رو تحلیل")) {
+            val f = ScreenCaptureService.latestScreenshot
+            if (f == null || !f.exists()) { callback("اول مجوز تحلیل صفحه را فعال کن، بعد بگو آنالیز صفحه."); return }
+            askAiWithImage("این تصویر صفحه بازی است. وضعیت، حریف یا تهدید اصلی و بهترین حرکت بعدی را فقط بر اساس چیزهای قابل مشاهده تحلیل کن. سه نکته کوتاه بده.", f, callback)
+            return
+        }
+
+        askAi(text, callback)
+    }
+
+    private fun cleanAppName(text: String): String = cleanGeneric(text, openWords + listOf("لطفا", "لطفاً", "را", "رو", "برام", "برای من", "کن"))
+
+    private fun cleanGeneric(text: String, words: List<String>): String {
+        var r = text
+        for (w in words) r = r.replace(Regex("(?i)(^|\\s)${Regex.escape(w)}(?=\\s|$)"), " ")
+        return normalize(r).trim()
+    }
+
+    private fun safeStart(intent: Intent): Boolean = try {
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(intent); true
+    } catch (_: Exception) { false }
+
+    private fun openSetting(action: String, success: String, callback: (String) -> Unit) {
+        if (safeStart(Intent(action))) callback(success) else callback("نتوانستم تنظیمات را باز کنم")
+    }
+
+    private fun askAiWithImage(prompt: String, file: java.io.File, callback: (String) -> Unit) {
+        val apiKey = PrefsHelper.getApiKey(context)
+        if (apiKey.isBlank()) { callback("برای تحلیل تصویر، اول کلید API را در تنظیمات وارد کن"); return }
+        executor.execute {
+            val bytes = try { file.readBytes() } catch (_: Exception) { null }
+            val reply = if (bytes == null) "تصویر خوانده نشد" else GeminiClient(apiKey).askImage(prompt, bytes)
+            mainHandler.post { callback(reply) }
+        }
+    }
+
+    private fun askAi(text: String, callback: (String) -> Unit) {
+        val apiKey = PrefsHelper.getApiKey(context)
+        if (apiKey.isBlank()) { callback("برای پاسخ به این سوال به کلید هوش مصنوعی نیاز دارم؛ یک کلید رایگان در تنظیمات وارد کن"); return }
+        executor.execute {
+            val reply = GeminiClient(apiKey).ask(text)
+            mainHandler.post { callback(reply) }
+        }
+    }
+}
+
+
+
+===== app/src/main/java/com/jarvis/assistant/AppLauncher.kt =====
+
+package com.jarvis.assistant
+
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.provider.Settings
+import java.util.Locale
+
+class AppLauncher(private val context: Context) {
+    private val knownApps = mapOf(
+        "اینستاگرام" to listOf("com.instagram.android"),
+        "instagram" to listOf("com.instagram.android"),
+        "تلگرام" to listOf("org.telegram.messenger", "org.telegram.messenger.web"),
+        "telegram" to listOf("org.telegram.messenger", "org.telegram.messenger.web"),
+        "واتساپ" to listOf("com.whatsapp", "com.whatsapp.w4b"),
+        "whatsapp" to listOf("com.whatsapp", "com.whatsapp.w4b"),
+        "یوتیوب" to listOf("com.google.android.youtube"),
+        "youtube" to listOf("com.google.android.youtube"),
+        "کروم" to listOf("com.android.chrome"),
+        "chrome" to listOf("com.android.chrome"),
+        "توییتر" to listOf("com.twitter.android"),
+        "ایکس" to listOf("com.twitter.android"),
+        "twitter" to listOf("com.twitter.android"),
+        "اسنپ" to listOf("com.snapp.passenger", "ir.snapp"),
+        "snapp" to listOf("com.snapp.passenger", "ir.snapp"),
+        "دیجی کالا" to listOf("com.digikala"),
+        "digikala" to listOf("com.digikala"),
+        "بله" to listOf("ir.nasim", "ir.bale.messenger", "ir.bale"),
+        "روبیکا" to listOf("ir.rubika.app", "ir.rubika"),
+        "ایتا" to listOf("ir.eitaa.messenger", "ir.eitaa")
+    )
+
+    fun openApp(spokenName: String): Boolean {
+        val q = normalize(spokenName)
+        if (q.isBlank()) return false
+
+        when {
+            q.contains("دوربین") || q == "camera" ->
+                return launchIntent(Intent("android.media.action.IMAGE_CAPTURE"))
+            q.contains("تنظیمات") || q == "settings" ->
+                return launchIntent(Intent(Settings.ACTION_SETTINGS))
+            q.contains("گالری") || q.contains("عکس ها") || q.contains("عکس‌ها") || q == "gallery" ->
+                return launchIntent(Intent(Intent.ACTION_VIEW, Uri.parse("content://media/internal/images/media"))) ||
+                    launchByCategory(Intent.CATEGORY_APP_GALLERY)
+            q.contains("مخاطبین") || q.contains("کانتکت") || q == "contacts" ->
+                return launchIntent(Intent(Intent.ACTION_VIEW, Uri.parse("content://contacts/people"))) ||
+                    launchByCategory(Intent.CATEGORY_APP_CONTACTS)
+            q.contains("پیامک") || q.contains("پیام ها") || q.contains("پیام‌ها") || q == "messages" ->
+                return launchIntent(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_APP_MESSAGING))
+            q.contains("پلی استور") || q.contains("play store") || q == "play" ->
+                return launchIntent(Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=com.android.vending"))) ||
+                    launchIntent(Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store")))
+        }
+
+        for ((key, packages) in knownApps) {
+            if (q == key || q.contains(key)) {
+                for (pkg in packages) {
+                    if (isInstalled(pkg) && launchPackage(pkg)) return true
+                }
+            }
+        }
+
+        // Fallback: match the visible application label installed on this phone.
+        val pm = context.packageManager
+        val apps = pm.getInstalledApplications(0)
+        val match = apps.firstOrNull { app ->
+            val label = normalize(pm.getApplicationLabel(app).toString())
+            label.isNotBlank() && (label == q || label.contains(q) || q.contains(label))
+        }
+        return match != null && launchPackage(match.packageName)
+    }
+
+    private fun isInstalled(pkg: String): Boolean = try {
+        context.packageManager.getApplicationInfo(pkg, 0)
+        true
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun normalize(s: String): String = s.trim()
+        .replace('ي', 'ی')
+        .replace('ك', 'ک')
+        .replace('ۀ', 'ه')
+        .replace('ة', 'ه')
+        .replace("‌", " ")
+        .replace(Regex("\\s+"), " ")
+        .lowercase(Locale.ROOT)
+
+    private fun launchPackage(pkg: String): Boolean = try {
+        val intent = context.packageManager.getLaunchIntentForPackage(pkg) ?: return false
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(intent)
+        true
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun launchIntent(intent: Intent): Boolean = try {
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (intent.resolveActivity(context.packageManager) == null) return false
+        context.startActivity(intent)
+        true
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun launchByCategory(category: String): Boolean = try {
+        val intent = Intent(Intent.ACTION_MAIN).addCategory(category)
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (intent.resolveActivity(context.packageManager) == null) return false
+        context.startActivity(intent)
+        true
+    } catch (_: Exception) {
+        false
+    }
+}
+
+
+
+===== app/src/main/java/com/jarvis/assistant/MainActivity.kt =====
+
+package com.jarvis.assistant
+
+import android.Manifest
+import android.app.Activity
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.Settings
+import android.text.InputType
+import android.view.ViewGroup
+import android.widget.*
+import androidx.appcompat.app.AlertDialog
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+
+class MainActivity : AppCompatActivity() {
+    companion object {
+        const val REQ_PERMISSIONS = 100
+        const val REQ_CAPTURE = 200
+        const val EXTRA_START_GAMING_CAPTURE = "start_gaming_capture"
+    }
+
+    private lateinit var toggle: Button
+    private lateinit var status: TextView
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        findViewById<Button>(R.id.btn_grant_overlay).setOnClickListener { requestOverlay() }
+        findViewById<Button>(R.id.btn_grant_mic).setOnClickListener { requestPermissionsIfNeeded() }
+        toggle = findViewById(R.id.btn_toggle_jarvis)
+        status = findViewById(R.id.tv_status)
+        findViewById<Button>(R.id.btn_api_mode).setOnClickListener { showApiSettings() }
+        findViewById<Button>(R.id.btn_screen_analysis).setOnClickListener { requestCapture() }
+        findViewById<Button>(R.id.btn_advanced_settings).setOnClickListener {
+            startActivity(Intent(this, JarvisSettingsActivity::class.java))
+        }
+
+        toggle.setOnClickListener {
+            if (!Settings.canDrawOverlays(this)) {
+                requestOverlay()
+                return@setOnClickListener
+            }
+            if (!hasMicPermission()) {
+                requestPermissionsIfNeeded()
+                return@setOnClickListener
+            }
+            if (!isJarvisRunning()) startJarvis() else stopJarvis()
+        }
+
+        if (intent.getBooleanExtra(EXTRA_START_GAMING_CAPTURE, false)) requestCapture()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshState()
+        // وقتی کاربر از صفحه مجوز برمی‌گردد، اگر هر دو مجوز آماده باشند
+        // جارویس بدون نیاز به زدن دکمه دوباره گوش‌به‌زنگ می‌شود.
+        if (isJarvisEnabled() && Settings.canDrawOverlays(this) && hasMicPermission() && !isJarvisRunning()) {
+            startJarvis()
+        }
+    }
+
+    private fun hasMicPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    private fun isJarvisRunning(): Boolean = OverlayService.isRunning
+
+    private fun isJarvisEnabled(): Boolean =
+        getPreferences(0).getBoolean("enabled", false)
+
+    private fun startJarvis() {
+        if (!Settings.canDrawOverlays(this) || !hasMicPermission()) return
+        try {
+            ContextCompat.startForegroundService(this, Intent(this, OverlayService::class.java))
+            getPreferences(0).edit().putBoolean("enabled", true).apply()
+            toggle.text = getString(R.string.stop_jarvis)
+            status.text = "جارویس آماده‌باش است — بگو «جارویس روشن»"
+        } catch (e: Exception) {
+            getPreferences(0).edit().putBoolean("enabled", false).apply()
+            status.text = "خطا در فعال‌سازی میکروفون"
+            toast("فعال‌سازی میکروفون ناموفق بود")
+        }
+    }
+
+    private fun stopJarvis() {
+        stopService(Intent(this, OverlayService::class.java))
+        getPreferences(0).edit().putBoolean("enabled", false).apply()
+        toggle.text = getString(R.string.start_jarvis)
+        status.text = "گوش‌به‌زنگ خاموش است"
+    }
+
+    private fun refreshState() {
+        if (isJarvisRunning()) {
+            toggle.text = getString(R.string.stop_jarvis)
+            status.text = "جارویس آماده‌باش است — بگو «جارویس روشن»"
+        } else {
+            toggle.text = getString(R.string.start_jarvis)
+            status.text = if (Settings.canDrawOverlays(this) && hasMicPermission()) "آماده" else "ابتدا مجوزها را فعال کن"
+        }
+    }
+
+    private fun requestOverlay() {
+        if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) {
+            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+        } else {
+            toast("اجازه نمایش فعال است")
+        }
+    }
+
+    private fun requestPermissionsIfNeeded() {
+        val list = mutableListOf<String>()
+        if (!hasMicPermission()) list.add(Manifest.permission.RECORD_AUDIO)
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            list.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (list.isEmpty()) {
+            toast("مجوزها فعال هستند")
+            if (Settings.canDrawOverlays(this)) startJarvis() else requestOverlay()
+        } else {
+            ActivityCompat.requestPermissions(this, list.toTypedArray(), REQ_PERMISSIONS)
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_PERMISSIONS) {
+            if (hasMicPermission() && Settings.canDrawOverlays(this)) {
+                startJarvis()
+            } else if (!hasMicPermission()) {
+                toast("اجازه میکروفون لازم است")
+            }
+            refreshState()
+        }
+    }
+
+    private fun requestCapture() {
+        val m = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        startActivityForResult(m.createScreenCaptureIntent(), REQ_CAPTURE)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_CAPTURE) {
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                val i = Intent(this, ScreenCaptureService::class.java).apply {
+                    putExtra(ScreenCaptureService.EXTRA_RESULT_CODE, resultCode)
+                    putExtra(ScreenCaptureService.EXTRA_RESULT_DATA, data)
+                }
+                ContextCompat.startForegroundService(this, i)
+                toast(if (GamingAiManager.isEnabled(this)) "تحلیل زنده بازی فعال شد" else "تحلیل صفحه فعال شد؛ داخل بازی بگو «جارویس آنالیز صفحه»")
+            } else {
+                if (GamingAiManager.isEnabled(this)) GamingAiManager.disable(this)
+                toast("مجوز تحلیل صفحه لغو شد")
+            }
+        }
+    }
+
+    private fun showApiSettings() {
+        val input = EditText(this).apply {
+            hint = "کلید API"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setSingleLine(true)
+            setText(PrefsHelper.getApiKey(this@MainActivity))
+            setSelection(text.length)
+        }
+        val box = FrameLayout(this).apply {
+            val p = (20 * resources.displayMetrics.density).toInt()
+            setPadding(p, 0, p, 0)
+            addView(input, ViewGroup.LayoutParams(-1, -2))
+        }
+        AlertDialog.Builder(this)
+            .setTitle("حالت API")
+            .setMessage("برای پاسخ آنلاین لازم است؛ کلید روی همین گوشی ذخیره می‌شود.")
+            .setView(box)
+            .setPositiveButton("ذخیره") { _, _ -> PrefsHelper.saveApiKey(this, input.text.toString()); toast("ذخیره شد") }
+            .setNeutralButton("پاک کردن") { _, _ -> PrefsHelper.saveApiKey(this, ""); toast("پاک شد") }
+            .setNegativeButton("لغو", null)
+            .show()
+    }
+
+    private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+}
+
+
+
+===== app/src/main/java/com/jarvis/assistant/AssistantTools.kt =====
+
+package com.jarvis.assistant
+
+import android.app.*
+import android.content.Context
+import android.content.BroadcastReceiver
+import android.content.Intent
+import android.os.Build
+import java.text.SimpleDateFormat
+import java.util.*
+
+object AssistantTools {
+    private const val PREFS = "jarvis_tools"
+    private const val NOTES = "notes"
+    private const val TASKS = "tasks"
+
+    private fun p(c: Context) = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    fun addNote(c: Context, text: String) {
+        val old = p(c).getString(NOTES, "") ?: ""
+        val stamp = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault()).format(Date())
+        p(c).edit().putString(NOTES, "$old\n[$stamp] $text").apply()
+    }
+
+    fun addTask(c: Context, text: String) {
+        val old = p(c).getString(TASKS, "") ?: ""
+        p(c).edit().putString(TASKS, "$old\n- $text").apply()
+    }
+
+    fun summary(c: Context): String {
+        val notes = p(c).getString(NOTES, "")?.trim().orEmpty()
+        val tasks = p(c).getString(TASKS, "")?.trim().orEmpty()
+        return "یادداشت‌ها:\n${if (notes.isEmpty()) "موردی ثبت نشده" else notes}\n\nکارها:\n${if (tasks.isEmpty()) "موردی ثبت نشده" else tasks}"
+    }
+
+    fun clear(c: Context) {
+        p(c).edit().remove(NOTES).remove(TASKS).apply()
+    }
+
+    fun setTimer(c: Context, seconds: Int, title: String = "تایمر جارویس") {
+        val ms = (seconds.coerceAtLeast(1) * 1000L)
+        val intent = Intent(c, ReminderReceiver::class.java).putExtra("title", title)
+        val pi = PendingIntent.getBroadcast(
+            c, System.nanoTime().toInt(), intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or if (Build.VERSION.SDK_INT >= 23) PendingIntent.FLAG_IMMUTABLE else 0
+        )
+        val am = c.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        if (Build.VERSION.SDK_INT >= 31 && am.canScheduleExactAlarms()) {
+            am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + ms, pi)
+        } else {
+            am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + ms, pi)
+        }
+    }
+}
+
+class ReminderReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent?) {
+        val title = intent?.getStringExtra("title") ?: "جارویس"
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val channelId = "jarvis_reminders"
+        if (Build.VERSION.SDK_INT >= 26) {
+            nm.createNotificationChannel(
+                NotificationChannel(channelId, "یادآوری‌های جارویس", NotificationManager.IMPORTANCE_HIGH)
+            )
+        }
+        val n: Notification
+        if (Build.VERSION.SDK_INT >= 26) {
+            n = Notification.Builder(context, channelId)
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentTitle(title)
+                .setContentText("زمان یادآوری فرا رسید.")
+                .setAutoCancel(true)
+                .build()
+        } else {
+            @Suppress("DEPRECATION")
+            val builder = Notification.Builder(context)
+            n = builder
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentTitle(title)
+                .setContentText("زمان یادآوری فرا رسید.")
+                .setAutoCancel(true)
+                .build()
+        }
+        nm.notify(System.currentTimeMillis().toInt(), n)
+    }
+}
+
+
+
+===== app/src/main/AndroidManifest.xml =====
+
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission" />
+    <uses-permission android:name="android.permission.WRITE_SETTINGS" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+        <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+<application android:allowBackup="true" android:icon="@mipmap/ic_launcher" android:label="Jarvis" android:supportsRtl="true" android:theme="@style/Theme.Jarvis">
+        <activity android:name=".DiagnosticsActivity" android:exported="false" />
+        <activity android:name=".SettingsEditorActivity" android:exported="false" />
+        <activity android:name=".JarvisSettingsActivity" android:exported="false" />
+        <activity android:name=".MainActivity" android:exported="true" android:label="Jarvis">
+            <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
+        </activity>
+        <service android:name=".OverlayService" android:enabled="true" android:exported="false" android:foregroundServiceType="microphone" />
+        <service android:name=".ScreenCaptureService" android:enabled="true" android:exported="false" android:foregroundServiceType="mediaProjection" />
+        <provider android:name="androidx.core.content.FileProvider" android:authorities="${applicationId}.fileprovider" android:exported="false" android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" />
+        </provider>
+            <receiver android:name=".ReminderReceiver" android:exported="false" />
+    </application>
+</manifest>
+
+
+
+===== app/build.gradle =====
+
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.jarvis.assistant'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.jarvis.assistant"
+        minSdk 26
+        targetSdk 34
+        versionCode 11
+        versionName "5.8-AllFix"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+    buildFeatures {
+        viewBinding true
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.12.0'
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.11.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+}
+
