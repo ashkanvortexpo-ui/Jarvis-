@@ -1289,7 +1289,7 @@ jobs:
         working-directory: JarvisApp_6.1-UltraVoiceWake
         run: |
           set -euo pipefail
-          grep -q 'versionCode 13' app/build.gradle
+          grep -q 'versionCode 14' app/build.gradle
           grep -q 'EXTRA_PARTIAL_RESULTS, true' app/src/main/java/com/jarvis/assistant/OverlayService.kt
           grep -q 'finishAndRemoveTask' app/src/main/java/com/jarvis/assistant/MainActivity.kt
           python3 - <<'PY'
