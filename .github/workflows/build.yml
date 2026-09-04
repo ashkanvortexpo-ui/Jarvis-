@@ -903,15 +903,18 @@ jobs:
             AEQTAABI6wAAAAA=
         run: |
           set -euo pipefail
-          rm -rf JarvisApp_6.1.1-UltraVoiceWake
+          rm -rf JarvisApp_6.1.1-UltraVoiceWake JarvisApp_6.1-UltraVoiceWake
           printf '%s' "$JARVIS_ZIP_B64" | tr -d '\n\r ' | base64 -d > /tmp/jarvis.zip
           unzip -q /tmp/jarvis.zip
-          test -f JarvisApp_6.1.1-UltraVoiceWake/settings.gradle
-          test -f JarvisApp_6.1.1-UltraVoiceWake/app/build.gradle
-          test -f JarvisApp_6.1.1-UltraVoiceWake/app/src/main/AndroidManifest.xml
-          test -f JarvisApp_6.1.1-UltraVoiceWake/app/src/main/java/com/jarvis/assistant/OverlayService.kt
+          PROJECT_DIR="$(find . -maxdepth 1 -mindepth 1 -type d -name 'JarvisApp_*' -print -quit)"
+          test -n "$PROJECT_DIR"
+          test -f "$PROJECT_DIR/settings.gradle"
+          test -f "$PROJECT_DIR/app/build.gradle"
+          test -f "$PROJECT_DIR/app/src/main/AndroidManifest.xml"
+          test -f "$PROJECT_DIR/app/src/main/java/com/jarvis/assistant/OverlayService.kt"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
       - name: Validate source
-        working-directory: JarvisApp_6.1.1-UltraVoiceWake
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -euo pipefail
           grep -q 'versionCode 15' app/build.gradle
@@ -923,10 +926,10 @@ jobs:
           print('Manifest XML OK')
           PY
       - name: Build APK
-        working-directory: JarvisApp_6.1.1-UltraVoiceWake
+        working-directory: ${{ env.PROJECT_DIR }}
         run: gradle --no-daemon --stacktrace :app:assembleDebug
       - name: Verify APK
-        working-directory: JarvisApp_6.1.1-UltraVoiceWake
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -euo pipefail
           test -s app/build/outputs/apk/debug/app-debug.apk
